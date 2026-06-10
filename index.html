@@ -89,6 +89,8 @@ footer.site p { font-size: 13px; color: var(--gray); }
 .v-btn.active { background: var(--red); }
 .v-stage { flex: 1; position: relative; overflow: hidden; padding: 22px 70px; display: flex; align-items: center; justify-content: center; }
 #flipbook { width: 100%; height: 100%; }
+.fb-page { background: #fff; overflow: hidden; }
+.fb-page img { width: 100%; height: 100%; object-fit: contain; display: block; user-select: none; pointer-events: none; -webkit-user-drag: none; }
 .v-nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 5; background: rgba(255,255,255,.09); border: none; color: var(--white); width: 46px; height: 70px; border-radius: 10px; font-size: 26px; cursor: pointer; transition: background .15s; }
 .v-nav:hover { background: var(--red); }
 .v-nav.prev { left: 12px; } .v-nav.next { right: 12px; }
@@ -231,7 +233,7 @@ const urlParams = new URLSearchParams(location.search);
 const COLLECTION = (urlParams.get('c') || '').toLowerCase().trim();
 const DEEP_CAT = (urlParams.get('cat') || '').trim();
 
-const state = { catalogs: [], current: null, pageFlip: null, bytes: null, pageCount: 0, curPage: 0, loadToken: 0 };
+const state = { catalogs: [], current: null, pageFlip: null, bytes: null, pageCount: 0, curPage: 0, loadToken: 0, imgEls: null, pageUrls: [] };
 
 function api(params) {
   const qs = new URLSearchParams(params);
@@ -317,7 +319,7 @@ function queueThumbnails(list) {
       img.alt = '';
       img.onload = function () { cover.innerHTML = ''; cover.appendChild(img); };
       img.onerror = function () { gasThumb(cat, cover); };
-      img.src = 'https://drive.google.com/thumbnail?id=' + cat.fileId + '&sz=w440';
+      img.src = 'https://drive.google.com/thumbnail?id=' + cat.fileId + '&sz=w800';
     } else {
       gasThumb(cat, cover);
     }
@@ -508,24 +510,37 @@ function makePlaceholder(dims) {
   return c.toDataURL('image/jpeg', 0.7);
 }
 
+// Render resolution adapts to the actual screen: full device-pixel height,
+// floored at 1400px, capped at 2200px to bound memory on huge displays.
+function pageTargetHeight() {
+  const dpr = window.devicePixelRatio || 1;
+  const sh = (window.screen && window.screen.height) || 900;
+  return Math.min(2200, Math.max(1400, Math.round(sh * dpr)));
+}
+
 function renderFlipbook(bytes, cat, token) {
   // pdf.js transfers the buffer to its worker — give it a copy so the
   // original stays usable for the download button and cache.
   return pdfjsLib.getDocument({ data: bytes.slice() }).promise.then(function (doc) {
     const n = doc.numPages;
-    const images = new Array(n);
+    const targetH = pageTargetHeight();
+    const srcs = new Array(n);
     let dims = null;
 
-    function renderPage(idx) { // 1-based
+    function renderPage(idx) { // 1-based; resolves {url, w, h} (blob object URL)
       return doc.getPage(idx).then(function (page) {
         const base = page.getViewport({ scale: 1 });
-        const scale = Math.min(3, 1500 / base.height, 1150 / base.width);
+        const scale = Math.min(3.5, targetH / base.height, 1700 / base.width);
         const vp = page.getViewport({ scale: scale });
         const canvas = document.createElement('canvas');
         canvas.width = vp.width; canvas.height = vp.height;
         return page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise.then(function () {
-          images[idx - 1] = canvas.toDataURL('image/jpeg', 0.82);
-          if (!dims) dims = { w: Math.round(vp.width), h: Math.round(vp.height) };
+          return new Promise(function (res) {
+            canvas.toBlob(function (blob) {
+              const url = blob ? URL.createObjectURL(blob) : canvas.toDataURL('image/jpeg', 0.88);
+              res({ url: url, w: Math.round(vp.width), h: Math.round(vp.height) });
+            }, 'image/jpeg', 0.88);
+          });
         });
       });
     }
@@ -536,7 +551,12 @@ function renderFlipbook(bytes, cat, token) {
         (function (i) {
           p = p.then(function () {
             if (token !== state.loadToken) throw new Error('cancelled');
-            return renderPage(i).then(function () { if (onEach) onEach(i); });
+            return renderPage(i).then(function (r) {
+              srcs[i - 1] = r.url;
+              state.pageUrls.push(r.url);
+              if (!dims) dims = { w: r.w, h: r.h };
+              if (onEach) onEach(i, r);
+            });
           });
         })(i);
       }
@@ -548,43 +568,47 @@ function renderFlipbook(bytes, cat, token) {
       setProgress(60 + (i / initial) * 36, 'Preparing pages…', i + ' / ' + n);
     }).then(function () {
       if (token !== state.loadToken) return;
-      // Open the book now — remaining pages render behind a placeholder
-      // and are swapped in when ready.
+      // Open the book now — remaining pages render in the background and
+      // are swapped into their live <img> elements as each completes.
       const ph = makePlaceholder(dims);
-      for (let i = 0; i < n; i++) if (!images[i]) images[i] = ph;
-      initPageFlip(images.slice(), dims, cat);
+      for (let i = 0; i < n; i++) if (!srcs[i]) srcs[i] = ph;
+      initPageFlip(srcs, dims, cat);
       if (initial < n) {
-        renderRange(initial + 1, n, null).then(function () {
-          if (token !== state.loadToken || !state.pageFlip) return;
-          const cur = state.curPage;
-          try {
-            if (typeof state.pageFlip.updateFromImages === 'function') {
-              state.pageFlip.updateFromImages(images);
-            } else {
-              initPageFlip(images.slice(), dims, cat, true);
-            }
-            state.pageFlip.turnToPage(cur);
-            state.curPage = cur;
-          } catch (e) {}
-          updatePageUI();
+        renderRange(initial + 1, n, function (i, r) {
+          const img = state.imgEls && state.imgEls[i - 1];
+          if (img) img.src = r.url;
         }).catch(function () {});
       }
     });
   });
 }
 
-function initPageFlip(images, dims, cat, keepPage) {
+function initPageFlip(srcs, dims, cat, keepPage) {
   destroyFlip();
-  state.pageCount = images.length;
+  state.pageCount = srcs.length;
   state.curPage = 0;
-  state.pageFlip = new St.PageFlip($('flipbook'), {
+  // HTML mode (live <img> elements) instead of canvas mode: images render
+  // at native device resolution (Retina-sharp), and background re-renders
+  // can swap a page by mutating img.src in place.
+  const fb = document.getElementById('flipbook');
+  state.imgEls = srcs.map(function (src) {
+    const pg = document.createElement('div');
+    pg.className = 'fb-page';
+    pg.setAttribute('data-density', 'soft');
+    const im = document.createElement('img');
+    im.src = src; im.alt = ''; im.draggable = false;
+    pg.appendChild(im);
+    fb.appendChild(pg);
+    return im;
+  });
+  state.pageFlip = new St.PageFlip(fb, {
     width: dims.w, height: dims.h,
     size: 'stretch',
     minWidth: 260, maxWidth: 1300, minHeight: 320, maxHeight: 1600,
     showCover: true, usePortrait: true,
     maxShadowOpacity: 0.35, mobileScrollSupport: false
   });
-  state.pageFlip.loadFromImages(images);
+  state.pageFlip.loadFromHTML(fb.querySelectorAll('.fb-page'));
   state.pageFlip.on('flip', function (e) {
     state.curPage = e.data;
     updatePageUI();
@@ -596,7 +620,7 @@ function initPageFlip(images, dims, cat, keepPage) {
   // snap back to the cover once the geometry is stable (first open only).
   if (!keepPage) {
     setTimeout(function () {
-      if (state.pageFlip && state.pageCount === images.length) {
+      if (state.pageFlip && state.pageCount === srcs.length) {
         try { state.pageFlip.turnToPage(0); } catch (e) {}
         state.curPage = 0;
         updatePageUI();
@@ -605,7 +629,7 @@ function initPageFlip(images, dims, cat, keepPage) {
   }
 
   const saved = Number(localStorage.getItem('cshub-bm-' + cat.id));
-  if (saved > 0 && saved < images.length) {
+  if (saved > 0 && saved < srcs.length) {
     const btn = $('v-resume');
     btn.textContent = '↩ Resume at page ' + (saved + 1);
     btn.classList.add('show');
@@ -628,8 +652,16 @@ function updatePageUI() {
   $('v-bookmark').classList.toggle('active', isBm);
 }
 
+function revokePageUrls() {
+  state.pageUrls.forEach(function (u) {
+    if (u.indexOf('blob:') === 0) { try { URL.revokeObjectURL(u); } catch (e) {} }
+  });
+  state.pageUrls = [];
+}
+
 function destroyFlip() {
   if (state.pageFlip) { try { state.pageFlip.destroy(); } catch (e) {} state.pageFlip = null; }
+  state.imgEls = null;
   // PageFlip.destroy() can remove the container itself — re-create it.
   let fb = document.getElementById('flipbook');
   if (!fb) {
@@ -643,6 +675,7 @@ function destroyFlip() {
 function closeViewer() {
   state.loadToken++;
   destroyFlip();
+  revokePageUrls();
   state.bytes = null;
   $('viewer').classList.remove('open');
   document.body.style.overflow = '';
