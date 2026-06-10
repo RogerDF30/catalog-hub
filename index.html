@@ -217,6 +217,9 @@ footer.site p { font-size: 13px; color: var(--gray); }
 
 <script>
 const API = 'https://script.google.com/macros/s/AKfycbwOamfXiqAxJ6pC0PXNcVUelluIMGlFDypmX5jqTch3J_0c7ox6FB6jD0x78yyLPkQrOg/exec';
+// Browser API key (Drive API, restrict to this site's referrer). When set,
+// PDFs stream directly from Google's CDN instead of relaying through GAS.
+const DRIVE_API_KEY = '';
 const CHUNK_BYTES = 6 * 1024 * 1024;   // must match backend CONFIG.CHUNK_BYTES
 const PARALLEL_CHUNKS = 5;             // concurrent chunk downloads
 const INITIAL_PAGES = 4;               // pages rendered before the book opens
@@ -303,18 +306,27 @@ function renderGrid(list) {
 }
 
 function queueThumbnails(list) {
-  let next = 0;
-  function worker() {
-    if (next >= list.length) return;
-    const i = next++;
-    api({ api: 'thumb', id: list[i].id }).then(function (d) {
-      if (d.dataUri) {
-        const cover = $('cover-' + i);
-        if (cover) cover.innerHTML = '<img src="' + d.dataUri + '" alt="">';
-      }
-    }).catch(function () {}).finally(worker);
+  // Fast path: Drive's public thumbnail endpoint, straight into <img>.
+  // On error (file not shared / thumbnail not generated yet), fall back
+  // to the GAS thumb endpoint.
+  list.forEach(function (cat, i) {
+    const cover = $('cover-' + i);
+    if (!cover) return;
+    if (cat.fileId) {
+      const img = document.createElement('img');
+      img.alt = '';
+      img.onload = function () { cover.innerHTML = ''; cover.appendChild(img); };
+      img.onerror = function () { gasThumb(cat, cover); };
+      img.src = 'https://drive.google.com/thumbnail?id=' + cat.fileId + '&sz=w440';
+    } else {
+      gasThumb(cat, cover);
+    }
+  });
+  function gasThumb(cat, cover) {
+    api({ api: 'thumb', id: cat.id }).then(function (d) {
+      if (d.dataUri) cover.innerHTML = '<img src="' + d.dataUri + '" alt="">';
+    }).catch(function () {});
   }
-  for (let k = 0; k < 4; k++) worker();
 }
 
 $('search').addEventListener('input', function () {
@@ -385,8 +397,50 @@ function downloadPdf(cat, token) {
     }).catch(function () {});
   }
 
-  // Chunks download in parallel (estimate from sizeMB), with a sequential
-  // tail-extend in case the sheet's size is stale and the file grew.
+  // Fast path: stream straight from the Drive API (files are link-shared;
+  // googleapis.com serves real CORS to browsers). Needs DRIVE_API_KEY.
+  // Returns null on any problem so the GAS chunk relay takes over.
+  // Note: drive.usercontent.google.com was tried and abandoned — Google
+  // 403s browser-fingerprinted anonymous requests there.
+  function directFetch() {
+    if (!cat.fileId || !DRIVE_API_KEY || typeof fetch !== 'function') return Promise.resolve(null);
+    const url = 'https://www.googleapis.com/drive/v3/files/' + cat.fileId + '?alt=media&key=' + DRIVE_API_KEY;
+    return fetch(url).then(function (r) {
+      if (!r.ok || !r.body) throw new Error('direct ' + r.status);
+      const reader = r.body.getReader();
+      const chunks = [];
+      function pump() {
+        return reader.read().then(function (res) {
+          if (token !== state.loadToken) { reader.cancel(); throw new Error('cancelled'); }
+          if (res.done) return null;
+          chunks.push(res.value);
+          received += res.value.length;
+          noteProgress();
+          return pump();
+        });
+      }
+      return pump().then(function () {
+        let total = 0;
+        chunks.forEach(function (c) { total += c.length; });
+        const all = new Uint8Array(total);
+        let off = 0;
+        chunks.forEach(function (c) { all.set(c, off); off += c.length; });
+        // Drive serves an HTML interstitial instead of bytes in some edge
+        // cases — verify the PDF magic before trusting it.
+        if (!(all[0] === 0x25 && all[1] === 0x50 && all[2] === 0x44 && all[3] === 0x46)) {
+          throw new Error('not a PDF');
+        }
+        return all;
+      });
+    }).catch(function (e) {
+      if (String(e && e.message) === 'cancelled') throw e;
+      received = 0;
+      return null;
+    });
+  }
+
+  // Fallback: chunks via the GAS relay, in parallel (estimate from sizeMB),
+  // with a sequential tail-extend in case the sheet's size is stale.
   function parallelFetch() {
     return new Promise(function (resolve, reject) {
       let next = 0, active = 0, failed = false;
@@ -417,6 +471,16 @@ function downloadPdf(cat, token) {
       received = cached.length;
       return cached;
     }
+    return directFetch().then(function (direct) {
+      if (direct) {
+        toCache(direct);
+        return direct;
+      }
+      return gasFetch();
+    });
+  });
+
+  function gasFetch() {
     return parallelFetch().then(function () {
       const keys = Object.keys(parts).map(Number).sort(function (a, b) { return a - b; });
       let total = 0;
@@ -427,7 +491,7 @@ function downloadPdf(cat, token) {
       toCache(all);
       return all;
     });
-  });
+  }
 }
 
 function makePlaceholder(dims) {
