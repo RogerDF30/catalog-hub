@@ -217,6 +217,9 @@ footer.site p { font-size: 13px; color: var(--gray); }
 
 <script>
 const API = 'https://script.google.com/macros/s/AKfycbwOamfXiqAxJ6pC0PXNcVUelluIMGlFDypmX5jqTch3J_0c7ox6FB6jD0x78yyLPkQrOg/exec';
+const CHUNK_BYTES = 6 * 1024 * 1024;   // must match backend CONFIG.CHUNK_BYTES
+const PARALLEL_CHUNKS = 5;             // concurrent chunk downloads
+const INITIAL_PAGES = 4;               // pages rendered before the book opens
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
@@ -357,59 +360,156 @@ function openCatalog(cat) {
 
 function downloadPdf(cat, token) {
   const estBytes = (cat.sizeMB || 0) * 1048576;
-  const chunks = [];
+  const cacheKey = './__pdfcache/' + encodeURIComponent(cat.id) + '-' + (cat.sizeMB || 0);
+  const parts = {};
   let received = 0;
-  function nextChunk(i) {
-    if (token !== state.loadToken) return Promise.reject(new Error('cancelled'));
-    return api({ api: 'chunk', id: cat.id, i: String(i) }).then(function (res) {
-      if (res.data) {
-        const part = b64ToBytes(res.data);
-        chunks.push(part);
-        received += part.length;
+
+  function noteProgress() {
+    const pct = estBytes ? (received / estBytes) * 55 : 25;
+    setProgress(2 + pct, 'Downloading ' + cat.name + '…',
+      Math.round(received / 1048576) + (estBytes ? ' / ' + Math.round(estBytes / 1048576) : '') + ' MB');
+  }
+
+  function fromCache() {
+    if (!('caches' in window)) return Promise.resolve(null);
+    return caches.open('cshub-pdf-v1')
+      .then(function (c) { return c.match(cacheKey); })
+      .then(function (r) { return r ? r.arrayBuffer().then(function (b) { return new Uint8Array(b); }) : null; })
+      .catch(function () { return null; });
+  }
+
+  function toCache(bytes) {
+    if (!('caches' in window)) return;
+    caches.open('cshub-pdf-v1').then(function (c) {
+      c.put(cacheKey, new Response(bytes.slice().buffer, { headers: { 'Content-Type': 'application/pdf' } }));
+    }).catch(function () {});
+  }
+
+  // Chunks download in parallel (estimate from sizeMB), with a sequential
+  // tail-extend in case the sheet's size is stale and the file grew.
+  function parallelFetch() {
+    return new Promise(function (resolve, reject) {
+      let next = 0, active = 0, failed = false;
+      let maxIndex = Math.max(0, Math.ceil(estBytes / CHUNK_BYTES) - 1);
+      function launch() {
+        if (failed) return;
+        while (active < PARALLEL_CHUNKS && next <= maxIndex) {
+          (function (i) {
+            active++; next++;
+            api({ api: 'chunk', id: cat.id, i: String(i) }).then(function (res) {
+              if (failed) return;
+              if (token !== state.loadToken) { failed = true; return reject(new Error('cancelled')); }
+              if (res.data) { const b = b64ToBytes(res.data); parts[i] = b; received += b.length; noteProgress(); }
+              if (!res.last && i === maxIndex) maxIndex++;  // size estimate was low — keep going
+              active--;
+              launch();
+              if (active === 0 && next > maxIndex) resolve();
+            }).catch(function (e) { if (!failed) { failed = true; reject(e); } });
+          })(next);
+        }
       }
-      const pct = estBytes ? (received / estBytes) * 55 : Math.min(50, (i + 1) * 10);
-      setProgress(2 + pct, 'Downloading ' + cat.name + '…',
-        Math.round(received / 1048576) + (estBytes ? ' / ' + Math.round(estBytes / 1048576) : '') + ' MB');
-      if (res.last) {
-        const all = new Uint8Array(received);
-        let off = 0;
-        chunks.forEach(function (c) { all.set(c, off); off += c.length; });
-        return all;
-      }
-      return nextChunk(i + 1);
+      launch();
     });
   }
-  return nextChunk(0);
-}
 
-function renderFlipbook(bytes, cat, token) {
-  return pdfjsLib.getDocument({ data: bytes }).promise.then(function (doc) {
-    const images = [];
-    let dims = null;
-    function renderPage(n) {
-      if (token !== state.loadToken) return Promise.reject(new Error('cancelled'));
-      return doc.getPage(n).then(function (page) {
-        const base = page.getViewport({ scale: 1 });
-        const scale = Math.min(3, 1600 / base.height, 1200 / base.width);
-        const vp = page.getViewport({ scale: scale });
-        const canvas = document.createElement('canvas');
-        canvas.width = vp.width; canvas.height = vp.height;
-        return page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise.then(function () {
-          images.push(canvas.toDataURL('image/jpeg', 0.85));
-          if (!dims) dims = { w: Math.round(vp.width), h: Math.round(vp.height) };
-          setProgress(57 + (n / doc.numPages) * 42, 'Preparing pages…', n + ' / ' + doc.numPages);
-          return n < doc.numPages ? renderPage(n + 1) : null;
-        });
-      });
+  return fromCache().then(function (cached) {
+    if (cached && cached.length) {
+      received = cached.length;
+      return cached;
     }
-    return renderPage(1).then(function () {
-      if (token !== state.loadToken) return;
-      initPageFlip(images, dims, cat);
+    return parallelFetch().then(function () {
+      const keys = Object.keys(parts).map(Number).sort(function (a, b) { return a - b; });
+      let total = 0;
+      keys.forEach(function (k) { total += parts[k].length; });
+      const all = new Uint8Array(total);
+      let off = 0;
+      keys.forEach(function (k) { all.set(parts[k], off); off += parts[k].length; });
+      toCache(all);
+      return all;
     });
   });
 }
 
-function initPageFlip(images, dims, cat) {
+function makePlaceholder(dims) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(2, Math.round(dims.w / 4));
+  c.height = Math.max(2, Math.round(dims.h / 4));
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#FDF2F2';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.fillStyle = '#AFAFAF';
+  ctx.font = '700 ' + Math.round(c.width / 12) + 'px Manrope, Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText('Loading…', c.width / 2, c.height / 2);
+  return c.toDataURL('image/jpeg', 0.7);
+}
+
+function renderFlipbook(bytes, cat, token) {
+  // pdf.js transfers the buffer to its worker — give it a copy so the
+  // original stays usable for the download button and cache.
+  return pdfjsLib.getDocument({ data: bytes.slice() }).promise.then(function (doc) {
+    const n = doc.numPages;
+    const images = new Array(n);
+    let dims = null;
+
+    function renderPage(idx) { // 1-based
+      return doc.getPage(idx).then(function (page) {
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(3, 1500 / base.height, 1150 / base.width);
+        const vp = page.getViewport({ scale: scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = vp.width; canvas.height = vp.height;
+        return page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise.then(function () {
+          images[idx - 1] = canvas.toDataURL('image/jpeg', 0.82);
+          if (!dims) dims = { w: Math.round(vp.width), h: Math.round(vp.height) };
+        });
+      });
+    }
+
+    function renderRange(from, to, onEach) {
+      let p = Promise.resolve();
+      for (let i = from; i <= to; i++) {
+        (function (i) {
+          p = p.then(function () {
+            if (token !== state.loadToken) throw new Error('cancelled');
+            return renderPage(i).then(function () { if (onEach) onEach(i); });
+          });
+        })(i);
+      }
+      return p;
+    }
+
+    const initial = Math.min(INITIAL_PAGES, n);
+    return renderRange(1, initial, function (i) {
+      setProgress(60 + (i / initial) * 36, 'Preparing pages…', i + ' / ' + n);
+    }).then(function () {
+      if (token !== state.loadToken) return;
+      // Open the book now — remaining pages render behind a placeholder
+      // and are swapped in when ready.
+      const ph = makePlaceholder(dims);
+      for (let i = 0; i < n; i++) if (!images[i]) images[i] = ph;
+      initPageFlip(images.slice(), dims, cat);
+      if (initial < n) {
+        renderRange(initial + 1, n, null).then(function () {
+          if (token !== state.loadToken || !state.pageFlip) return;
+          const cur = state.curPage;
+          try {
+            if (typeof state.pageFlip.updateFromImages === 'function') {
+              state.pageFlip.updateFromImages(images);
+            } else {
+              initPageFlip(images.slice(), dims, cat, true);
+            }
+            state.pageFlip.turnToPage(cur);
+            state.curPage = cur;
+          } catch (e) {}
+          updatePageUI();
+        }).catch(function () {});
+      }
+    });
+  });
+}
+
+function initPageFlip(images, dims, cat, keepPage) {
   destroyFlip();
   state.pageCount = images.length;
   state.curPage = 0;
@@ -429,14 +529,16 @@ function initPageFlip(images, dims, cat) {
   updatePageUI();
 
   // The stretch-resize during layout settle can leave the book mid-document —
-  // snap back to the cover once the geometry is stable.
-  setTimeout(function () {
-    if (state.pageFlip && state.pageCount === images.length) {
-      try { state.pageFlip.turnToPage(0); } catch (e) {}
-      state.curPage = 0;
-      updatePageUI();
-    }
-  }, 450);
+  // snap back to the cover once the geometry is stable (first open only).
+  if (!keepPage) {
+    setTimeout(function () {
+      if (state.pageFlip && state.pageCount === images.length) {
+        try { state.pageFlip.turnToPage(0); } catch (e) {}
+        state.curPage = 0;
+        updatePageUI();
+      }
+    }, 450);
+  }
 
   const saved = Number(localStorage.getItem('cshub-bm-' + cat.id));
   if (saved > 0 && saved < images.length) {
@@ -464,7 +566,14 @@ function updatePageUI() {
 
 function destroyFlip() {
   if (state.pageFlip) { try { state.pageFlip.destroy(); } catch (e) {} state.pageFlip = null; }
-  $('flipbook').innerHTML = '';
+  // PageFlip.destroy() can remove the container itself — re-create it.
+  let fb = document.getElementById('flipbook');
+  if (!fb) {
+    fb = document.createElement('div');
+    fb.id = 'flipbook';
+    document.getElementById('v-stage').insertBefore(fb, document.getElementById('v-next'));
+  }
+  fb.innerHTML = '';
 }
 
 function closeViewer() {
