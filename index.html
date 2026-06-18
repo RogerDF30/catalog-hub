@@ -306,15 +306,28 @@ function loadCatalogs(force) {
     state.catalogs = data.catalogs;
     renderGrid(data.catalogs);
     $('stat-count').textContent = data.catalogs.length;
-    if (DEEP_CAT && !state.deepOpened) {
-      state.deepOpened = true;
-      const hit = data.catalogs.filter(function (c) { return c.id === DEEP_CAT; })[0];
-      if (hit) openCatalog(hit);
-      else api({ api: 'catalog', id: DEEP_CAT }).then(function (d) { openCatalog(d.catalog); }).catch(function () {});
+    if (!state.deepOpened) {
+      // 1) Explicit deep link: ?cat=<ID>  (hidden catalogs also need ?c=<code>)
+      if (DEEP_CAT) {
+        state.deepOpened = true;
+        const hit = data.catalogs.filter(function (c) { return c.id === DEEP_CAT; })[0];
+        if (hit) openCatalog(hit);
+        else api({ api: 'catalog', id: DEEP_CAT }).then(function (d) { openCatalog(d.catalog); }).catch(function (err) { deepLinkDenied(); });
+      }
+      // 2) Single-catalog collection link: ?c=<code> resolving to exactly one catalog opens straight into the flipbook
+      else if (COLLECTION && data.catalogs.length === 1) {
+        state.deepOpened = true;
+        openCatalog(data.catalogs[0]);
+      }
     }
   }).catch(function (err) {
     $('grid').innerHTML = '<div class="empty"><b>Could not load catalogs.</b> ' + String(err && err.message || err) + '</div>';
   }).finally(function () { $('refresh').classList.remove('spin'); });
+}
+
+function deepLinkDenied() {
+  $('grid').innerHTML = '<div class="empty"><b>This catalog isn\u2019t available from this link.</b><br>' +
+    'The link may have expired, or this catalog needs a valid access code. Please contact your CompanyStore.IO representative.</div>';
 }
 
 function renderGrid(list) {
